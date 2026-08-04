@@ -1,9 +1,12 @@
+@'
 import os
 import logging
 import json
 import asyncio
+import threading
 import requests
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from groq import Groq
 from serpapi import GoogleSearch
@@ -21,24 +24,16 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 PIXABAY_KEY = os.getenv("PIXABAY_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-_allowed_user_ids_raw = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
-ALLOWED_USER_IDS = {
-    int(user_id.strip())
-    for user_id in _allowed_user_ids_raw.split(",")
-    if user_id.strip().isdigit()
-}
 
 logging.basicConfig(level=logging.INFO)
 groq_client = Groq(api_key=GROQ_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 IST = timezone(timedelta(hours=5, minutes=30))
-TELEGRAM_CAPTION_HARD_LIMIT = 1024   # Telegram ka technical limit, hardcode nahi kar rahe content ko, ye Telegram ka rule hai
+TELEGRAM_CAPTION_HARD_LIMIT = 1024
 TELEGRAM_MESSAGE_HARD_LIMIT = 4096
 MAX_HISTORY = 20
 
-# Har chat ke scheduled task ko memory mein rakho, taaki "posting band karo"
-# daily, interval aur one-time posts sab ko cancel kar sake.
 scheduled_jobs = {}
 
 TOPIC_VARIANTS = [
@@ -49,6 +44,24 @@ TOPIC_VARIANTS = [
     "AI research breakthrough",
     "AI product update",
 ]
+
+
+# ---------- Health check server (Render ke liye) ----------
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
 
 
 # ---------- Persistent memory (Supabase) ----------
@@ -126,12 +139,6 @@ def get_current_time_str():
     return get_current_datetime().strftime("%I:%M %p, %d %B %Y")
 
 
-def is_authorized(update: Update):
-    """Optional owner lock: empty env var keeps existing open-access behavior."""
-    user = update.effective_user
-    return not ALLOWED_USER_IDS or (user is not None and user.id in ALLOWED_USER_IDS)
-
-
 def safe_json_parse(text, fallback):
     try:
         cleaned = text.strip().replace("```json", "").replace("```", "").strip()
@@ -142,7 +149,6 @@ def safe_json_parse(text, fallback):
 
 
 def trim_to_telegram_limit(text, max_len):
-    """Ye sirf Telegram ke technical limit se bachne ke liye hai, content-style ko chhota karne ke liye nahi"""
     if len(text) <= max_len:
         return text
     trimmed = text[:max_len - 3]
@@ -152,7 +158,6 @@ def trim_to_telegram_limit(text, max_len):
 
 
 def track_scheduled_job(chat_id, task):
-    """Task ko register kare aur complete hone par list se hata de."""
     scheduled_jobs.setdefault(chat_id, []).append(task)
 
     def remove_finished_task(completed_task):
@@ -180,10 +185,8 @@ def cancel_scheduled_jobs(chat_id):
 # ---------- Command handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     await update.message.reply_text(
-        "Hi! Main AI Updates Bot hu 🤖\n\n"
+        "Hi! Main AI Updates Bot hu \U0001F916\n\n"
         "Mujhse jaise chaho, jab chaho, jitna chaho bol sakte ho - main samajh ke kaam karunga.\n"
         "Post karwane, style customize karne, schedule set karne, sab kuch bas bol ke ho sakta hai.\n"
         "Rokne ke liye: 'posting band karo'\n"
@@ -193,8 +196,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     await update.message.reply_text(
         "Bas jaise chaho bol do, main samajh ke karunga:\n"
         "- 'channel pe AI news post karo'\n"
@@ -208,12 +209,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     chat_id = update.effective_chat.id
     count = cancel_scheduled_jobs(chat_id)
     if count > 0:
-        await update.message.reply_text(f"✅ {count} recurring posting task(s) band kar diye.")
+        await update.message.reply_text(f"OK, {count} recurring posting task(s) band kar diye.")
     else:
         await update.message.reply_text("Koi active recurring posting nahi mil raha thi.")
 
@@ -235,7 +234,6 @@ def search_topic(topic):
 
 
 def pick_fresh_headline(topic):
-    """Multiple queries try karta hai jab tak ek non-duplicate headline na mile"""
     queries_to_try = [topic] + [t for t in TOPIC_VARIANTS if t != topic]
     for query in queries_to_try[:4]:
         headlines, snippets_map = search_topic(query)
@@ -248,10 +246,6 @@ def pick_fresh_headline(topic):
 
 
 def generate_post_text(topic, headline, snippets, style_instructions):
-    """
-    Style instructions ko poori tarah AI decide karne deta hai - koi hardcoded word/char limit nahi.
-    Agar user ne kuch specific nahi bola, AI khud ek achha default format chunta hai (suggestion, rule nahi).
-    """
     try:
         snippet_text = "\n".join(snippets) if snippets else "No extra details available."
 
@@ -284,10 +278,10 @@ CRITICAL RULES:
             max_tokens=800
         )
         text = response.choices[0].message.content
-        return text if text else f"Update: {headline} 🤖"
+        return text if text else f"Update: {headline}"
     except Exception as e:
         print(f"Groq content generation error: {e}")
-        return f"Update: {headline} 🤖"
+        return f"Update: {headline}"
 
 
 def generate_image_query(post_text):
@@ -367,7 +361,7 @@ async def execute_post(chat_id, topic, style_instructions, bot):
         headline, snippets = pick_fresh_headline(topic)
 
         if is_already_posted(headline):
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ Naya update nahi mila abhi ('{topic}'), thodi der baad try karo.")
+            await bot.send_message(chat_id=chat_id, text=f"Naya update nahi mila abhi ('{topic}'), thodi der baad try karo.")
             return False
 
         post_text = generate_post_text(topic, headline, snippets, style_instructions)
@@ -387,16 +381,16 @@ async def execute_post(chat_id, topic, style_instructions, bot):
 
         if success:
             save_post_record(headline, post_text)
-            await bot.send_message(chat_id=chat_id, text="✅ Post ho gaya channel pe!")
+            await bot.send_message(chat_id=chat_id, text="Post ho gaya channel pe!")
             return True
         else:
-            await bot.send_message(chat_id=chat_id, text=f"❌ Post fail hua: {error_detail[:300]}")
+            await bot.send_message(chat_id=chat_id, text=f"Post fail hua: {error_detail[:300]}")
             return False
 
     except Exception as e:
         print(f"execute_post fatal error: {e}")
         try:
-            await bot.send_message(chat_id=chat_id, text=f"❌ Kuch galat ho gaya: {str(e)[:300]}")
+            await bot.send_message(chat_id=chat_id, text=f"Kuch galat ho gaya: {str(e)[:300]}")
         except Exception:
             pass
         return False
@@ -429,7 +423,6 @@ async def recurring_daily_post(chat_id, topic, style_instructions, hour, minute,
 
 
 async def recurring_interval_post(chat_id, topic, style_instructions, interval_seconds, bot):
-    """User jo bhi interval bole, exactly wahi use hoga - koi minimum force nahi"""
     try:
         while True:
             await execute_post(chat_id, topic, style_instructions, bot)
@@ -449,19 +442,17 @@ async def do_post(update, context, topic, style_instructions, delay_seconds=0):
 
     if delay_seconds and delay_seconds > 0:
         minutes = round(delay_seconds / 60, 2)
-        await update.message.reply_text(f"⏰ Theek hai! {minutes} minute baad '{topic}' par post ho jayega channel pe.")
+        await update.message.reply_text(f"Theek hai! {minutes} minute baad '{topic}' par post ho jayega channel pe.")
         track_scheduled_job(
             chat_id,
             asyncio.create_task(delayed_post(chat_id, topic, style_instructions, delay_seconds, context.bot)),
         )
     else:
-        await update.message.reply_text(f"⏳ '{topic}' par post bana rahe hai, thoda ruko...")
+        await update.message.reply_text(f"'{topic}' par post bana rahe hai, thoda ruko...")
         await execute_post(chat_id, topic, style_instructions, context.bot)
 
 
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     if not context.args:
         await update.message.reply_text("Format: /post [topic] | [style instructions]")
         return
@@ -476,7 +467,7 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await do_post(update, context, topic, style, delay_seconds=0)
 
 
-# ---------- Message classification (fully flexible) ----------
+# ---------- Message classification ----------
 
 def classify_message(user_message):
     fallback = {
@@ -511,19 +502,18 @@ Field meanings:
   - "post_request": wants a post published to the channel, in ANY form - now, later, once, daily, repeating
   - "stop_posting_request": wants to stop/cancel any ongoing repeating or scheduled posting
   - "chat": anything else - questions, conversation, general knowledge, asking about past actions
-- "style": extract ANY instructions about how the post content should look - length, tone, format, emojis, bullet points, bold, etc. Preserve their exact intent, don't paraphrase away specifics.
+- "style": extract ANY instructions about how the post content should look - length, tone, format, emojis, bullet points, bold, etc.
 - "schedule_kind" (only if type is post_request):
   - "none": post immediately
   - "once": one-time post after a delay or at a specific future moment. Fill "delay_seconds" = exact seconds from now.
   - "daily": every day at a fixed clock time. Fill "hour" (0-23) and "minute" (0-59).
-  - "interval": repeatedly every fixed duration. Fill "interval_seconds" = duration in seconds, using EXACTLY what the user said (e.g. "30 sec" = 30, "0.5 min" = 30, "har 2 ghante" = 7200). Do not round or adjust this value.
+  - "interval": repeatedly every fixed duration. Fill "interval_seconds" = duration in seconds, using EXACTLY what the user said.
 - Use the current time above to calculate any relative/absolute times precisely.
 
 Examples:
 "abhi post karo" -> type: post_request, schedule_kind: none
 "5 min baad post karo" -> type: post_request, schedule_kind: once, delay_seconds: 300
 "har 30 sec post karo" -> type: post_request, schedule_kind: interval, interval_seconds: 30
-"har 0.5 min post karo" -> type: post_request, schedule_kind: interval, interval_seconds: 30
 "roz subah 7 baje post karo" -> type: post_request, schedule_kind: daily, hour: 7, minute: 0
 "bullet points mein, 200 words ka casual post karo" -> type: post_request, style: "bullet points, 200 words, casual tone"
 "posting rok do" -> type: stop_posting_request
@@ -592,8 +582,6 @@ Examples:
 # ---------- Main message handler ----------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
     cleanup_old_history()
 
     chat_id = update.effective_chat.id
@@ -618,7 +606,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     interval_seconds = result.get("interval_seconds")
 
     if msg_type == "time_query":
-        reply = f"Abhi time hai: {get_current_time_str()} (IST) 🕐"
+        reply = f"Abhi time hai: {get_current_time_str()} (IST)"
         add_to_history(chat_id, "user", user_message)
         add_to_history(chat_id, "assistant", reply)
         await update.message.reply_text(reply)
@@ -626,7 +614,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if msg_type == "stop_posting_request":
         count = cancel_scheduled_jobs(chat_id)
-        reply = f"✅ {count} recurring posting task(s) band kar diye." if count > 0 else "Koi active recurring posting nahi mil rahi thi."
+        reply = f"{count} recurring posting task(s) band kar diye." if count > 0 else "Koi active recurring posting nahi mil rahi thi."
         add_to_history(chat_id, "user", user_message)
         add_to_history(chat_id, "assistant", reply)
         await update.message.reply_text(reply)
@@ -641,12 +629,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             time_str = f"{rec_hour:02d}:{rec_minute:02d}"
             add_to_history(chat_id, "assistant", f"[Daily recurring post set for {time_str}, topic: {topic}]")
-            track_scheduled_job(
-                chat_id,
-                asyncio.create_task(recurring_daily_post(chat_id, topic, style, rec_hour, rec_minute, context.bot)),
-            )
+            task = asyncio.create_task(recurring_daily_post(chat_id, topic, style, rec_hour, rec_minute, context.bot))
+            track_scheduled_job(chat_id, task)
             await update.message.reply_text(
-                f"✅ Theek hai! Roz {time_str} (IST) baje '{topic}' par post ho jayega, jab tak bot chalu hai. "
+                f"Theek hai! Roz {time_str} (IST) baje '{topic}' par post ho jayega, jab tak bot chalu hai. "
                 f"Rokne ke liye 'posting band karo' bolna."
             )
             return
@@ -660,12 +646,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 readable = f"{round(interval_seconds / 60, 2)} minute"
             add_to_history(chat_id, "assistant", f"[Repeating post every {readable} set, topic: {topic}]")
-            track_scheduled_job(
-                chat_id,
-                asyncio.create_task(recurring_interval_post(chat_id, topic, style, interval_seconds, context.bot)),
-            )
+            task = asyncio.create_task(recurring_interval_post(chat_id, topic, style, interval_seconds, context.bot))
+            track_scheduled_job(chat_id, task)
             await update.message.reply_text(
-                f"✅ Theek hai! Ab har {readable} mein '{topic}' par naya post hoga. "
+                f"Theek hai! Ab har {readable} mein '{topic}' par naya post hoga. "
                 f"Rokne ke liye 'posting band karo' bolna."
             )
             return
@@ -711,12 +695,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print(f"handle_message chat error: {e}")
-        await update.message.reply_text("❌ Kuch technical issue aa gaya, dobara try karo please.")
+        await update.message.reply_text("Kuch technical issue aa gaya, dobara try karo please.")
 
 
 # ---------- Entry point ----------
 
 def main():
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     request = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
@@ -732,3 +718,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+'@ | Out-File -FilePath reply_bot.py -Encoding utf8

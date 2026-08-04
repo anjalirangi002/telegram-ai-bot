@@ -1,4 +1,3 @@
-@'
 import os
 import logging
 import json
@@ -718,4 +717,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'@ | Out-File -FilePath reply_bot.py -Encoding utf8

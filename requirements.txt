@@ -1,4 +1,4 @@
-﻿python-telegram-bot==21.6
+﻿python-telegram-bot
 groq
 google-search-results==2.4.2
 requests==2.31.0

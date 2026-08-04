@@ -21,6 +21,12 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 PIXABAY_KEY = os.getenv("PIXABAY_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+_allowed_user_ids_raw = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
+ALLOWED_USER_IDS = {
+    int(user_id.strip())
+    for user_id in _allowed_user_ids_raw.split(",")
+    if user_id.strip().isdigit()
+}
 
 logging.basicConfig(level=logging.INFO)
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -31,7 +37,9 @@ TELEGRAM_CAPTION_HARD_LIMIT = 1024   # Telegram ka technical limit, hardcode nah
 TELEGRAM_MESSAGE_HARD_LIMIT = 4096
 MAX_HISTORY = 20
 
-recurring_jobs = {}
+# Har chat ke scheduled task ko memory mein rakho, taaki "posting band karo"
+# daily, interval aur one-time posts sab ko cancel kar sake.
+scheduled_jobs = {}
 
 TOPIC_VARIANTS = [
     "latest AI news",
@@ -118,6 +126,12 @@ def get_current_time_str():
     return get_current_datetime().strftime("%I:%M %p, %d %B %Y")
 
 
+def is_authorized(update: Update):
+    """Optional owner lock: empty env var keeps existing open-access behavior."""
+    user = update.effective_user
+    return not ALLOWED_USER_IDS or (user is not None and user.id in ALLOWED_USER_IDS)
+
+
 def safe_json_parse(text, fallback):
     try:
         cleaned = text.strip().replace("```json", "").replace("```", "").strip()
@@ -137,20 +151,37 @@ def trim_to_telegram_limit(text, max_len):
     return trimmed + "..."
 
 
-def cancel_recurring_jobs(chat_id):
-    jobs = recurring_jobs.get(chat_id, [])
+def track_scheduled_job(chat_id, task):
+    """Task ko register kare aur complete hone par list se hata de."""
+    scheduled_jobs.setdefault(chat_id, []).append(task)
+
+    def remove_finished_task(completed_task):
+        jobs = scheduled_jobs.get(chat_id, [])
+        if completed_task in jobs:
+            jobs.remove(completed_task)
+        if not jobs:
+            scheduled_jobs.pop(chat_id, None)
+
+    task.add_done_callback(remove_finished_task)
+    return task
+
+
+def cancel_scheduled_jobs(chat_id):
+    jobs = scheduled_jobs.get(chat_id, [])
     count = 0
     for job in jobs:
         if not job.done():
             job.cancel()
             count += 1
-    recurring_jobs[chat_id] = []
+    scheduled_jobs.pop(chat_id, None)
     return count
 
 
 # ---------- Command handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
     await update.message.reply_text(
         "Hi! Main AI Updates Bot hu 🤖\n\n"
         "Mujhse jaise chaho, jab chaho, jitna chaho bol sakte ho - main samajh ke kaam karunga.\n"
@@ -162,6 +193,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
     await update.message.reply_text(
         "Bas jaise chaho bol do, main samajh ke karunga:\n"
         "- 'channel pe AI news post karo'\n"
@@ -175,8 +208,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
     chat_id = update.effective_chat.id
-    count = cancel_recurring_jobs(chat_id)
+    count = cancel_scheduled_jobs(chat_id)
     if count > 0:
         await update.message.reply_text(f"✅ {count} recurring posting task(s) band kar diye.")
     else:
@@ -415,13 +450,18 @@ async def do_post(update, context, topic, style_instructions, delay_seconds=0):
     if delay_seconds and delay_seconds > 0:
         minutes = round(delay_seconds / 60, 2)
         await update.message.reply_text(f"⏰ Theek hai! {minutes} minute baad '{topic}' par post ho jayega channel pe.")
-        asyncio.create_task(delayed_post(chat_id, topic, style_instructions, delay_seconds, context.bot))
+        track_scheduled_job(
+            chat_id,
+            asyncio.create_task(delayed_post(chat_id, topic, style_instructions, delay_seconds, context.bot)),
+        )
     else:
         await update.message.reply_text(f"⏳ '{topic}' par post bana rahe hai, thoda ruko...")
         await execute_post(chat_id, topic, style_instructions, context.bot)
 
 
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
     if not context.args:
         await update.message.reply_text("Format: /post [topic] | [style instructions]")
         return
@@ -533,7 +573,9 @@ Examples:
 
         interval = data.get("interval_seconds")
         try:
-            interval = float(interval) if interval is not None and interval > 0 else None
+            interval = float(interval) if interval is not None else None
+            if interval is not None and interval <= 0:
+                interval = None
         except (ValueError, TypeError):
             interval = None
 
@@ -550,6 +592,8 @@ Examples:
 # ---------- Main message handler ----------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
     cleanup_old_history()
 
     chat_id = update.effective_chat.id
@@ -581,7 +625,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if msg_type == "stop_posting_request":
-        count = cancel_recurring_jobs(chat_id)
+        count = cancel_scheduled_jobs(chat_id)
         reply = f"✅ {count} recurring posting task(s) band kar diye." if count > 0 else "Koi active recurring posting nahi mil rahi thi."
         add_to_history(chat_id, "user", user_message)
         add_to_history(chat_id, "assistant", reply)
@@ -597,8 +641,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             time_str = f"{rec_hour:02d}:{rec_minute:02d}"
             add_to_history(chat_id, "assistant", f"[Daily recurring post set for {time_str}, topic: {topic}]")
-            task = asyncio.create_task(recurring_daily_post(chat_id, topic, style, rec_hour, rec_minute, context.bot))
-            recurring_jobs.setdefault(chat_id, []).append(task)
+            track_scheduled_job(
+                chat_id,
+                asyncio.create_task(recurring_daily_post(chat_id, topic, style, rec_hour, rec_minute, context.bot)),
+            )
             await update.message.reply_text(
                 f"✅ Theek hai! Roz {time_str} (IST) baje '{topic}' par post ho jayega, jab tak bot chalu hai. "
                 f"Rokne ke liye 'posting band karo' bolna."
@@ -614,8 +660,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 readable = f"{round(interval_seconds / 60, 2)} minute"
             add_to_history(chat_id, "assistant", f"[Repeating post every {readable} set, topic: {topic}]")
-            task = asyncio.create_task(recurring_interval_post(chat_id, topic, style, interval_seconds, context.bot))
-            recurring_jobs.setdefault(chat_id, []).append(task)
+            track_scheduled_job(
+                chat_id,
+                asyncio.create_task(recurring_interval_post(chat_id, topic, style, interval_seconds, context.bot)),
+            )
             await update.message.reply_text(
                 f"✅ Theek hai! Ab har {readable} mein '{topic}' par naya post hoga. "
                 f"Rokne ke liye 'posting band karo' bolna."
